@@ -67,7 +67,7 @@ def display_rain_animation(animation: FuncAnimation) -> HTML:
     """Display a rain animation inline in a Jupyter notebook."""
 
     html = HTML(animation.to_jshtml())
-    display(html)
+
     return html
 
 
