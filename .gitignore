@@ -6,3 +6,5 @@ venv/
 *.egg-info/
 .pytest_cache/
 doc_extract.txt
+*.docx
+.DS_Store
