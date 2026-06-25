@@ -41,7 +41,7 @@ sys.path.insert(0, str(SCRIPT_DIR))          # june26/simulate.py
 sys.path.insert(0, str(PROJECT_DIR / "Nir"))  # Nir/state_space_rain.py
 
 from simulate import deploy_links, deploy_stations, save_links_csv, save_stations_csv
-from state_space_rain import (
+from simulation.state_space_rain import (
     StateGrid,
     build_transition_matrix,
     gaussian_initial_field,
