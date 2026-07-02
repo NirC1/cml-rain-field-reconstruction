@@ -11,6 +11,7 @@ from rain import (
     TimeSpec,
     simulate_advection_diffusion_rain,
 )
+from rain.advection_diffusion import build_initial_field
 
 
 class AdvectionDiffusionRainTest(unittest.TestCase):
@@ -95,6 +96,23 @@ class AdvectionDiffusionRainTest(unittest.TestCase):
 
         self.assertLess(_roughness(smooth.values_mm_h[1]), _roughness(rough.values_mm_h[1]))
 
+    def test_gaussian_initial_condition_uses_full_covariance_matrix(self):
+        grid = GridSpec(
+            domain_width_km=20.0,
+            domain_height_km=20.0,
+            dx_km=0.5,
+            dy_km=0.5,
+        )
+        condition = GaussianInitialCondition(
+            mu_km=np.array([10.0, 10.0]),
+            covariance_km2=np.array([[4.0, 1.5], [1.5, 2.0]]),
+            intensity_mm_h=10.0,
+        )
+
+        field = build_initial_field(grid, (condition,))
+
+        self.assertGreater(_weighted_xy_covariance(grid, field), 0.0)
+
 
 def _small_config(
     *,
@@ -121,10 +139,8 @@ def _small_config(
         random_seed=random_seed,
         initial_conditions=(
             GaussianInitialCondition(
-                center_x_km=3.0,
-                center_y_km=6.0,
-                sigma_x_km=1.0,
-                sigma_y_km=1.0,
+                mu_km=np.array([3.0, 6.0]),
+                covariance_km2=np.array([[1.0, 0.0], [0.0, 1.0]]),
                 intensity_mm_h=10.0,
             ),
         ),
@@ -141,6 +157,14 @@ def _roughness(field: np.ndarray) -> float:
         np.mean(np.diff(field, axis=0) ** 2)
         + np.mean(np.diff(field, axis=1) ** 2)
     )
+
+
+def _weighted_xy_covariance(grid: GridSpec, field: np.ndarray) -> float:
+    xx, yy = np.meshgrid(grid.x_centers_km, grid.y_centers_km)
+    total = field.sum()
+    mean_x = float((xx * field).sum() / total)
+    mean_y = float((yy * field).sum() / total)
+    return float((((xx - mean_x) * (yy - mean_y) * field).sum()) / total)
 
 
 if __name__ == "__main__":

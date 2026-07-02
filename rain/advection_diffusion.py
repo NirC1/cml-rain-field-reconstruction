@@ -16,11 +16,31 @@ BoundaryCondition = Literal["periodic"]
 class GaussianInitialCondition:
     """A Gaussian initial rain field used to seed the PDE simulation."""
 
-    center_x_km: float
-    center_y_km: float
-    sigma_x_km: float
-    sigma_y_km: float
+    mu_km: np.ndarray
+    covariance_km2: np.ndarray
     intensity_mm_h: float
+
+    def __post_init__(self) -> None:
+        mu_km = np.asarray(self.mu_km, dtype=float)
+        covariance_km2 = np.asarray(self.covariance_km2, dtype=float)
+
+        if mu_km.shape != (2,):
+            raise ValueError("mu_km must be a numpy array with shape (2,).")
+        if covariance_km2.shape != (2, 2):
+            raise ValueError(
+                "covariance_km2 must be a numpy array with shape (2, 2)."
+            )
+        if not np.allclose(covariance_km2, covariance_km2.T):
+            raise ValueError("covariance_km2 must be symmetric.")
+        if np.any(np.linalg.eigvalsh(covariance_km2) <= 0.0):
+            raise ValueError("covariance_km2 must be positive definite.")
+        if self.intensity_mm_h < 0.0:
+            raise ValueError("intensity_mm_h must be nonnegative.")
+
+        mu_km.setflags(write=False)
+        covariance_km2.setflags(write=False)
+        object.__setattr__(self, "mu_km", mu_km)
+        object.__setattr__(self, "covariance_km2", covariance_km2)
 
 
 @dataclass(frozen=True)
@@ -46,17 +66,15 @@ class AdvectionDiffusionConfig:
     boundary_condition: BoundaryCondition = "periodic"
     initial_conditions: tuple[GaussianInitialCondition, ...] = (
         GaussianInitialCondition(
-            center_x_km=8.0,
-            center_y_km=15.0,
-            sigma_x_km=1.4,
-            sigma_y_km=2.0,
+            mu_km=np.array([8.0, 15.0]),
+            covariance_km2=np.array([[1.4**2, 0.0], 
+                                     [0.0, 2.0**2]]),
             intensity_mm_h=35.0,
         ),
         GaussianInitialCondition(
-            center_x_km=18.0,
-            center_y_km=9.0,
-            sigma_x_km=2.0,
-            sigma_y_km=1.2,
+            mu_km=np.array([18.0, 9.0]),
+            covariance_km2=np.array([[2.0**2, 0.0], 
+                                     [0.0, 1.2**2]]),
             intensity_mm_h=22.0,
         ),
     )
@@ -120,7 +138,8 @@ def simulate_advection_diffusion_rain(
             "process_noise_sigma_km": config.process_noise_sigma_km,
             "boundary_condition": config.boundary_condition,
             "initial_conditions": [
-                condition.__dict__ for condition in config.initial_conditions
+                _initial_condition_metadata(condition)
+                for condition in config.initial_conditions
             ],
             "update": "explicit_upwind_advection_centered_diffusion",
         },
@@ -151,13 +170,29 @@ def build_initial_field(
     field = np.zeros(grid.shape_yx, dtype=np.float64)
 
     for condition in initial_conditions:
-        exponent = (
-            ((xx - condition.center_x_km) ** 2) / (2.0 * condition.sigma_x_km**2)
-            + ((yy - condition.center_y_km) ** 2) / (2.0 * condition.sigma_y_km**2)
+        dx = xx - condition.mu_km[0]
+        dy = yy - condition.mu_km[1]
+        offsets = np.stack((dx, dy), axis=-1)
+        covariance_inv = np.linalg.inv(condition.covariance_km2)
+        exponent = 0.5 * np.einsum(
+            "...i,ij,...j->...",
+            offsets,
+            covariance_inv,
+            offsets,
         )
         field += condition.intensity_mm_h * np.exp(-exponent)
 
     return field
+
+
+def _initial_condition_metadata(
+    condition: GaussianInitialCondition,
+) -> dict[str, float | list[float] | list[list[float]]]:
+    return {
+        "mu_km": condition.mu_km.tolist(),
+        "covariance_km2": condition.covariance_km2.tolist(),
+        "intensity_mm_h": condition.intensity_mm_h,
+    }
 
 
 def advection_diffusion_step(
