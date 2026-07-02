@@ -59,6 +59,7 @@ class AdvectionDiffusionConfig:
         default_factory=lambda: TimeSpec(duration_h=1.0, dt_h=1.0 / 60.0)
     )
     wind_velocity_km_h: tuple[float, float] = (8.0, 3.0)
+    wind_field_km_h: np.ndarray | None = None
     diffusion_km2_h: float = 0.04
     decay_h_inv: float = 0.02
     process_noise_std_mm_h_sqrt_h: float = 0.0
@@ -115,6 +116,7 @@ def simulate_advection_diffusion_rain(
             grid=config.grid,
             dt_h=config.time.dt_h,
             wind_velocity_km_h=config.wind_velocity_km_h,
+            wind_field_km_h=config.wind_field_km_h,
             diffusion_km2_h=config.diffusion_km2_h,
             decay_h_inv=config.decay_h_inv,
             process_noise_std_mm_h_sqrt_h=config.process_noise_std_mm_h_sqrt_h,
@@ -132,6 +134,11 @@ def simulate_advection_diffusion_rain(
         random_seed=config.random_seed,
         model_params={
             "wind_velocity_km_h": config.wind_velocity_km_h,
+            "wind_field_km_h_shape": (
+                None
+                if config.wind_field_km_h is None
+                else np.asarray(config.wind_field_km_h).shape
+            ),
             "diffusion_km2_h": config.diffusion_km2_h,
             "decay_h_inv": config.decay_h_inv,
             "process_noise_std_mm_h_sqrt_h": config.process_noise_std_mm_h_sqrt_h,
@@ -146,7 +153,7 @@ def simulate_advection_diffusion_rain(
         metadata={
             "array_convention": "values_mm_h[t, y, x]",
             "grid_convention": "cell_centered_pixels",
-            "pde": "dR/dt = -u R_x - v R_y + D laplacian(R) - lambda R + eta",
+            "pde": "dR/dt = -div(u R) + D laplacian(R) - lambda R + eta",
             "state_space_view": "x[k+1] = F x[k] + w[k], applied matrix-free",
             "intended_downstream_modules": [
                 "sensor_map_generator",
@@ -203,6 +210,7 @@ def advection_diffusion_step(
     wind_velocity_km_h: tuple[float, float],
     diffusion_km2_h: float,
     decay_h_inv: float,
+    wind_field_km_h: np.ndarray | None = None,
     process_noise_std_mm_h_sqrt_h: float = 0.0,
     process_noise_sigma_km: float = 1.0,
     rng: np.random.Generator | None = None,
@@ -213,14 +221,22 @@ def advection_diffusion_step(
     if boundary_condition != "periodic":
         raise NotImplementedError("Only periodic boundaries are implemented for now.")
 
-    u_km_h, v_km_h = wind_velocity_km_h
-    d_rain_dx = _upwind_x_derivative(field_mm_h, grid.dx_km, u_km_h)
-    d_rain_dy = _upwind_y_derivative(field_mm_h, grid.dy_km, v_km_h)
+    if wind_field_km_h is None:
+        u_km_h, v_km_h = wind_velocity_km_h
+        d_rain_dx = _upwind_x_derivative(field_mm_h, grid.dx_km, u_km_h)
+        d_rain_dy = _upwind_y_derivative(field_mm_h, grid.dy_km, v_km_h)
+        advection = -u_km_h * d_rain_dx - v_km_h * d_rain_dy
+    else:
+        _validate_wind_field(wind_field_km_h, grid)
+        advection = -_upwind_flux_divergence(
+            field_mm_h,
+            wind_field_km_h,
+            grid=grid,
+        )
     laplacian = _periodic_laplacian(field_mm_h, grid.dx_km, grid.dy_km)
 
     tendency = (
-        -u_km_h * d_rain_dx
-        - v_km_h * d_rain_dy
+        advection
         + diffusion_km2_h * laplacian
         - decay_h_inv * field_mm_h
     )
@@ -263,6 +279,34 @@ def _periodic_laplacian(field: np.ndarray, dx_km: float, dy_km: float) -> np.nda
         + np.roll(field, shift=1, axis=0)
     ) / dy_km**2
     return second_x + second_y
+
+
+def _upwind_flux_divergence(
+    field: np.ndarray,
+    wind_field_km_h: np.ndarray,
+    *,
+    grid: GridSpec,
+) -> np.ndarray:
+    """Return div(u R) using first-order upwind fluxes at cell faces."""
+
+    wind_field = np.asarray(wind_field_km_h, dtype=float)
+    u_cell = wind_field[..., 0]
+    v_cell = wind_field[..., 1]
+
+    u_right = 0.5 * (u_cell + np.roll(u_cell, shift=-1, axis=1))
+    r_right = np.where(u_right >= 0.0, field, np.roll(field, shift=-1, axis=1))
+    flux_x_right = u_right * r_right
+    flux_x_left = np.roll(flux_x_right, shift=1, axis=1)
+
+    v_top = 0.5 * (v_cell + np.roll(v_cell, shift=-1, axis=0))
+    r_top = np.where(v_top >= 0.0, field, np.roll(field, shift=-1, axis=0))
+    flux_y_top = v_top * r_top
+    flux_y_bottom = np.roll(flux_y_top, shift=1, axis=0)
+
+    return (
+        (flux_x_right - flux_x_left) / grid.dx_km
+        + (flux_y_top - flux_y_bottom) / grid.dy_km
+    )
 
 
 def _smoothed_process_noise(
@@ -338,10 +382,12 @@ def _validate_config(config: AdvectionDiffusionConfig) -> None:
         raise ValueError("process_noise_std_mm_h_sqrt_h must be nonnegative.")
     if config.process_noise_sigma_km < 0.0:
         raise ValueError("process_noise_sigma_km must be nonnegative.")
+    if config.wind_field_km_h is not None:
+        _validate_wind_field(config.wind_field_km_h, config.grid)
 
-    u_km_h, v_km_h = config.wind_velocity_km_h
-    cfl_x = abs(u_km_h) * config.time.dt_h / config.grid.dx_km
-    cfl_y = abs(v_km_h) * config.time.dt_h / config.grid.dy_km
+    max_abs_u_km_h, max_abs_v_km_h = _wind_speed_limits(config)
+    cfl_x = max_abs_u_km_h * config.time.dt_h / config.grid.dx_km
+    cfl_y = max_abs_v_km_h * config.time.dt_h / config.grid.dy_km
     diff_x = config.diffusion_km2_h * config.time.dt_h / config.grid.dx_km**2
     diff_y = config.diffusion_km2_h * config.time.dt_h / config.grid.dy_km**2
     stability_margin = 1.0 - cfl_x - cfl_y - 2.0 * diff_x - 2.0 * diff_y
@@ -351,3 +397,27 @@ def _validate_config(config: AdvectionDiffusionConfig) -> None:
             "Unstable explicit advection-diffusion config: reduce dt_h, "
             "wind speed, or diffusion."
         )
+
+
+def _validate_wind_field(wind_field_km_h: np.ndarray, grid: GridSpec) -> None:
+    wind_field = np.asarray(wind_field_km_h)
+    expected_shape = (grid.ny, grid.nx, 2)
+    if wind_field.shape != expected_shape:
+        raise ValueError(
+            f"wind_field_km_h has shape {wind_field.shape}, "
+            f"expected {expected_shape}."
+        )
+    if not np.all(np.isfinite(wind_field)):
+        raise ValueError("wind_field_km_h must contain only finite values.")
+
+
+def _wind_speed_limits(config: AdvectionDiffusionConfig) -> tuple[float, float]:
+    if config.wind_field_km_h is None:
+        u_km_h, v_km_h = config.wind_velocity_km_h
+        return abs(u_km_h), abs(v_km_h)
+
+    wind_field = np.asarray(config.wind_field_km_h)
+    return (
+        float(np.max(np.abs(wind_field[..., 0]))),
+        float(np.max(np.abs(wind_field[..., 1]))),
+    )

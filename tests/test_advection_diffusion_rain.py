@@ -51,6 +51,39 @@ class AdvectionDiffusionRainTest(unittest.TestCase):
             _x_center_of_mass(rain.grid, rain.values_mm_h[0]),
         )
 
+    def test_uniform_wind_field_matches_constant_wind_velocity(self):
+        base_config = _small_config(
+            wind_velocity_km_h=(1.0, 0.5),
+            diffusion_km2_h=0.02,
+            decay_h_inv=0.0,
+        )
+        wind_field = np.zeros((base_config.grid.ny, base_config.grid.nx, 2))
+        wind_field[..., 0] = 1.0
+        wind_field[..., 1] = 0.5
+        field_config = _small_config(
+            wind_velocity_km_h=(99.0, 99.0),
+            wind_field_km_h=wind_field,
+            diffusion_km2_h=0.02,
+            decay_h_inv=0.0,
+        )
+
+        constant = simulate_advection_diffusion_rain(base_config)
+        variable = simulate_advection_diffusion_rain(field_config)
+
+        np.testing.assert_allclose(variable.values_mm_h, constant.values_mm_h)
+
+    def test_zero_wind_field_overrides_constant_wind_velocity(self):
+        config = _small_config(
+            wind_velocity_km_h=(1.0, 0.0),
+            wind_field_km_h=np.zeros((12, 10, 2)),
+            diffusion_km2_h=0.0,
+            decay_h_inv=0.0,
+        )
+
+        rain = simulate_advection_diffusion_rain(config)
+
+        np.testing.assert_allclose(rain.values_mm_h[-1], rain.values_mm_h[0])
+
     def test_seeded_process_noise_is_reproducible(self):
         config = _small_config(
             process_noise_std_mm_h_sqrt_h=0.5,
@@ -117,6 +150,7 @@ class AdvectionDiffusionRainTest(unittest.TestCase):
 def _small_config(
     *,
     wind_velocity_km_h=(1.0, 0.0),
+    wind_field_km_h=None,
     diffusion_km2_h=0.0,
     decay_h_inv=0.0,
     process_noise_std_mm_h_sqrt_h=0.0,
@@ -132,6 +166,7 @@ def _small_config(
         ),
         time=TimeSpec(duration_h=0.6, dt_h=0.1),
         wind_velocity_km_h=wind_velocity_km_h,
+        wind_field_km_h=wind_field_km_h,
         diffusion_km2_h=diffusion_km2_h,
         decay_h_inv=decay_h_inv,
         process_noise_std_mm_h_sqrt_h=process_noise_std_mm_h_sqrt_h,
