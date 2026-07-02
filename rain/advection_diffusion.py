@@ -41,6 +41,8 @@ class AdvectionDiffusionConfig:
     wind_velocity_km_h: tuple[float, float] = (8.0, 3.0)
     diffusion_km2_h: float = 0.04
     decay_h_inv: float = 0.02
+    process_noise_std_mm_h_sqrt_h: float = 0.0
+    process_noise_sigma_km: float = 1.0
     boundary_condition: BoundaryCondition = "periodic"
     initial_conditions: tuple[GaussianInitialCondition, ...] = (
         GaussianInitialCondition(
@@ -71,6 +73,7 @@ def simulate_advection_diffusion_rain(
     config.grid.validate()
     config.time.validate()
     _validate_config(config)
+    rng = np.random.default_rng(config.random_seed)
 
     if initial_field_mm_h is None:
         current = build_initial_field(config.grid, config.initial_conditions)
@@ -96,6 +99,9 @@ def simulate_advection_diffusion_rain(
             wind_velocity_km_h=config.wind_velocity_km_h,
             diffusion_km2_h=config.diffusion_km2_h,
             decay_h_inv=config.decay_h_inv,
+            process_noise_std_mm_h_sqrt_h=config.process_noise_std_mm_h_sqrt_h,
+            process_noise_sigma_km=config.process_noise_sigma_km,
+            rng=rng,
             boundary_condition=config.boundary_condition,
         )
         values[time_index] = np.maximum(current, 0.0)
@@ -110,6 +116,8 @@ def simulate_advection_diffusion_rain(
             "wind_velocity_km_h": config.wind_velocity_km_h,
             "diffusion_km2_h": config.diffusion_km2_h,
             "decay_h_inv": config.decay_h_inv,
+            "process_noise_std_mm_h_sqrt_h": config.process_noise_std_mm_h_sqrt_h,
+            "process_noise_sigma_km": config.process_noise_sigma_km,
             "boundary_condition": config.boundary_condition,
             "initial_conditions": [
                 condition.__dict__ for condition in config.initial_conditions
@@ -119,8 +127,8 @@ def simulate_advection_diffusion_rain(
         metadata={
             "array_convention": "values_mm_h[t, y, x]",
             "grid_convention": "cell_centered_pixels",
-            "pde": "dR/dt = -u R_x - v R_y + D laplacian(R) - lambda R",
-            "state_space_view": "x[k+1] = F x[k], applied matrix-free",
+            "pde": "dR/dt = -u R_x - v R_y + D laplacian(R) - lambda R + eta",
+            "state_space_view": "x[k+1] = F x[k] + w[k], applied matrix-free",
             "intended_downstream_modules": [
                 "sensor_map_generator",
                 "measurement_simulator",
@@ -160,6 +168,9 @@ def advection_diffusion_step(
     wind_velocity_km_h: tuple[float, float],
     diffusion_km2_h: float,
     decay_h_inv: float,
+    process_noise_std_mm_h_sqrt_h: float = 0.0,
+    process_noise_sigma_km: float = 1.0,
+    rng: np.random.Generator | None = None,
     boundary_condition: BoundaryCondition = "periodic",
 ) -> np.ndarray:
     """Advance one explicit finite-difference step."""
@@ -178,7 +189,19 @@ def advection_diffusion_step(
         + diffusion_km2_h * laplacian
         - decay_h_inv * field_mm_h
     )
-    return field_mm_h + dt_h * tendency
+    next_field = field_mm_h + dt_h * tendency
+    if process_noise_std_mm_h_sqrt_h > 0.0:
+        if rng is None:
+            rng = np.random.default_rng()
+        next_field = next_field + _smoothed_process_noise(
+            shape=field_mm_h.shape,
+            grid=grid,
+            std_mm_h_sqrt_h=process_noise_std_mm_h_sqrt_h,
+            dt_h=dt_h,
+            sigma_km=process_noise_sigma_km,
+            rng=rng,
+        )
+    return next_field
 
 
 def _upwind_x_derivative(field: np.ndarray, dx_km: float, u_km_h: float) -> np.ndarray:
@@ -207,11 +230,79 @@ def _periodic_laplacian(field: np.ndarray, dx_km: float, dy_km: float) -> np.nda
     return second_x + second_y
 
 
+def _smoothed_process_noise(
+    *,
+    shape: tuple[int, int],
+    grid: GridSpec,
+    std_mm_h_sqrt_h: float,
+    dt_h: float,
+    sigma_km: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Generate Gaussian-smoothed additive model-error noise."""
+
+    noise = rng.normal(
+        loc=0.0,
+        scale=std_mm_h_sqrt_h * np.sqrt(dt_h),
+        size=shape,
+    )
+    return _gaussian_convolve_periodic(
+        noise,
+        sigma_x_cells=sigma_km / grid.dx_km,
+        sigma_y_cells=sigma_km / grid.dy_km,
+    )
+
+
+def _gaussian_convolve_periodic(
+    field: np.ndarray,
+    *,
+    sigma_x_cells: float,
+    sigma_y_cells: float,
+) -> np.ndarray:
+    """Convolve a 2D field with a separable Gaussian using periodic boundaries."""
+
+    if sigma_x_cells == 0.0 and sigma_y_cells == 0.0:
+        return field
+
+    result = field
+    if sigma_x_cells > 0.0:
+        kernel_x = _gaussian_kernel_1d(sigma_x_cells)
+        result = _convolve_periodic_1d(result, kernel_x, axis=1)
+    if sigma_y_cells > 0.0:
+        kernel_y = _gaussian_kernel_1d(sigma_y_cells)
+        result = _convolve_periodic_1d(result, kernel_y, axis=0)
+    return result
+
+
+def _gaussian_kernel_1d(sigma_cells: float) -> np.ndarray:
+    radius = max(1, int(np.ceil(3.0 * sigma_cells)))
+    offsets = np.arange(-radius, radius + 1)
+    kernel = np.exp(-(offsets**2) / (2.0 * sigma_cells**2))
+    return kernel / kernel.sum()
+
+
+def _convolve_periodic_1d(
+    field: np.ndarray,
+    kernel: np.ndarray,
+    *,
+    axis: int,
+) -> np.ndarray:
+    radius = len(kernel) // 2
+    result = np.zeros_like(field, dtype=np.float64)
+    for offset, weight in zip(range(-radius, radius + 1), kernel):
+        result += weight * np.roll(field, shift=offset, axis=axis)
+    return result
+
+
 def _validate_config(config: AdvectionDiffusionConfig) -> None:
     if config.diffusion_km2_h < 0.0:
         raise ValueError("diffusion_km2_h must be nonnegative.")
     if config.decay_h_inv < 0.0:
         raise ValueError("decay_h_inv must be nonnegative.")
+    if config.process_noise_std_mm_h_sqrt_h < 0.0:
+        raise ValueError("process_noise_std_mm_h_sqrt_h must be nonnegative.")
+    if config.process_noise_sigma_km < 0.0:
+        raise ValueError("process_noise_sigma_km must be nonnegative.")
 
     u_km_h, v_km_h = config.wind_velocity_km_h
     cfl_x = abs(u_km_h) * config.time.dt_h / config.grid.dx_km
@@ -225,4 +316,3 @@ def _validate_config(config: AdvectionDiffusionConfig) -> None:
             "Unstable explicit advection-diffusion config: reduce dt_h, "
             "wind speed, or diffusion."
         )
-
